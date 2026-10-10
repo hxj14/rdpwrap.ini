@@ -1,0 +1,121 @@
+name: Sync upstream (force)
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # UTC 0/6/12/18
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Force sync with upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout (with full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.pat }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config gc.auto 0
+          git config protocol.version 2
+          # Make subsequent git pushes use the PAT (covers push origin ... --force)
+          git remote set-url origin https://x-access-token:${PAT}@github.com/hxj14/rdpwrap.ini
+        env:
+          PAT: ${{ secrets.pat }}
+
+      - name: Add upstream remote (idempotent)
+        run: |
+          # Remove existing upstream if present, then add (keeps step idempotent)
+          git remote remove upstream || true
+          git remote add upstream https://github.com/sebaxakerhtc/rdpwrap.ini.git
+          git remote -v
+
+      - name: Detect upstream default branch
+        id: detect
+        run: |
+          DEFAULT_BRANCH=$(git ls-remote --symref upstream HEAD | awk '/^ref:/ {print $2}' | sed 's@^refs/heads/@@')
+          if [ -z "$DEFAULT_BRANCH" ]; then
+            echo "::error::Cannot detect upstream default branch"
+            exit 1
+          fi
+          echo "branch=$DEFAULT_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "Upstream default branch: $DEFAULT_BRANCH"
+
+      - name: Backup local GitHub Actions workflows
+        run: |
+          mkdir -p /tmp/actions-backup
+          if [ -d ".github/workflows" ]; then
+            # Copy the whole .github/workflows directory verbatim (preserves subdirs too)
+            cp -a .github/workflows/. /tmp/actions-backup/
+            echo "Backed up local .github/workflows to /tmp/actions-backup"
+            echo "--- Backed-up files ---"
+            (cd /tmp/actions-backup && find . -type f | sort)
+          else
+            echo "No .github/workflows directory in fork; nothing to back up."
+          fi
+
+      - name: Stash any local changes (safety net)
+        run: |
+          # In case other files were modified locally, stash them so we can restore later
+          git stash push -u -m "pre-sync-backup" || true
+
+      - name: Force reset fork to upstream
+        run: |
+          BR="${{ steps.detect.outputs.branch }}"
+          git fetch --prune --tags --force upstream
+          git checkout -B "$BR" "upstream/$BR"
+          git push origin "$BR" --force
+          git push origin --tags --force
+
+      - name: Restore local GitHub Actions workflows
+        run: |
+          if [ -d "/tmp/actions-backup" ] && [ -n "$(ls -A /tmp/actions-backup 2>/dev/null)" ]; then
+            mkdir -p .github/workflows
+            # Copy back, preserving permissions/timestamps; existing upstream files of the
+            # same name are overwritten by the fork's local versions.
+            cp -a /tmp/actions-backup/. .github/workflows/
+            echo "--- Restored files ---"
+            (cd .github/workflows && find . -type f | sort)
+
+            # Show a diff vs upstream for one of them so it's easy to verify in the log
+            echo "--- Diff sample (local vs HEAD) ---"
+            git diff --stat HEAD -- .github/workflows || true
+          else
+            echo "No backup to restore."
+          fi
+
+      - name: Re-apply any stashed local changes
+        run: |
+          # Pop the stash only if it actually contains something
+          if git stash list | grep -q "pre-sync-backup"; then
+            git stash pop || echo "::warning::Stash pop failed (likely conflicts); resolve manually."
+          else
+            echo "No stashed changes to restore."
+          fi
+
+      - name: Commit and push restored action files
+        run: |
+          git add .github/workflows
+          # Only commit if there is actually a change
+          if git diff --cached --quiet; then
+            echo "No changes in .github/workflows; nothing to commit."
+            exit 0
+          fi
+          COMMIT_MSG="ci: restore fork-specific GitHub Actions after upstream sync"
+          COMMIT_MSG="${COMMIT_MSG}"$'\n\n'"Keeps local workflow definitions (this sync-upstream.yml and any others)"
+          COMMIT_MSG="${COMMIT_MSG}"$'\n'"on top of the force-reset upstream HEAD."
+          git commit -m "$COMMIT_MSG"
+          git push origin "${{ steps.detect.outputs.branch }}"
